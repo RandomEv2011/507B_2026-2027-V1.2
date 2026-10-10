@@ -1,0 +1,1126 @@
+/*----------------------------------------------------------------------------*/
+/*    Module:       main.cpp   (VEXcode - single file version)               */
+/*    Description:  Devices + odometry + PID + lift + autonomous + drivectrl */
+/*----------------------------------------------------------------------------*/
+
+#include "vex.h"
+#include <cstdio>
+using namespace vex;
+
+// ============================================================
+// DEVICES
+// ============================================================
+motor RF(PORT1, gearSetting::ratio6_1, false);
+motor LF(PORT11, gearSetting::ratio6_1, true);
+motor RB(PORT10, gearSetting::ratio6_1, false);
+motor LB(PORT20, gearSetting::ratio6_1, true);
+
+motor_group RS(RF, RB);
+motor_group LS(LF, LB);
+controller Con = controller();
+competition Competition;
+brain Brain;
+
+//=============================================================
+// Intake
+// ============================================================
+motor Intake(PORT21, gearSetting::ratio6_1, false);
+// Spins the intake a set number of motor degrees (blocking).
+void IntakeSpinDegrees(double speed_pct, double deg) {
+    Intake.spinFor(directionType::fwd, deg, rotationUnits::deg, speed_pct, velocityUnits::pct, true);
+}
+// ============================================================
+// HELPERS
+// ============================================================
+double clampd(double value, double lo, double hi) {
+    if (value < lo) return lo;
+    if (value > hi) return hi;
+    return value;
+}
+
+// Joystick inputs within +/-5% are treated as zero.
+const double DRIVE_DEAD_ZONE = 5.0;
+double apply_dead_zone(double value) {
+    if (fabs(value) < DRIVE_DEAD_ZONE) return 0.0;
+    return value;
+}
+
+double normalize_deg(double deg); // defined below
+
+// ============================================================
+// ODOMETRY (DRIVE MOTOR ENCODERS ONLY)
+// ============================================================
+// Tune these for your robot:
+//  - DRIVE_WHEEL_DIAMETER_IN: drive wheel diameter (in)
+//  - ROBOT_TRACK_WIDTH_IN: left-to-right wheel center distance (in). Effective
+//    value, so calibrate it with test turns.
+//  - DRIVE_GEAR_RATIO: wheel turns per motor turn from EXTERNAL gearing
+//    (1.0 = direct drive; the 6:1 cartridge is already handled by the motor).
+//  - LEFT/RIGHT_ODOM_SCALE: fix a straight-line distance error per side.
+//  - TURN_ODOM_SCALE: fix heading error (spin 10 full turns; if it reads
+//    less than 3600 deg, raise this value, and vice versa).
+const double DRIVE_WHEEL_DIAMETER_IN = 2.75;
+const double ROBOT_TRACK_WIDTH_IN = 15.0;
+const double DRIVE_GEAR_RATIO = 1.0;
+const double LEFT_ODOM_SCALE = 1.0;
+const double RIGHT_ODOM_SCALE = 1.0;
+const double TURN_ODOM_SCALE = 1.0;
+const double DRIVE_INCHES_PER_DEGREE =
+    (M_PI * DRIVE_WHEEL_DIAMETER_IN * DRIVE_GEAR_RATIO) / 360.0;
+
+// These values are shared between the odometry, display, and autonomous tasks.
+// volatile makes each task reread the current value instead of reusing a cached one.
+volatile double global_x = 0.0;
+volatile double global_y = 0.0;
+volatile double global_heading_rad = 0.0;
+volatile double prev_right_wheel_deg = 0.0;
+volatile double prev_left_wheel_deg = 0.0;
+volatile bool odom_initialized = false;
+
+// Field coordinates: origin (0,0) = field center (144in x 144in).
+// +y = "top" wall, +x = "right" (blue) wall. Heading 0 = facing +y.
+enum StartPosition {
+    RED_LEFT,
+    RED_BOTTOM,
+    BLUE_RIGHT,
+    BLUE_TOP
+};
+StartPosition startPos = RED_LEFT; // set before each match
+
+enum AutonStrategy {
+    SIDEA,
+    SIDEB,
+    SIDEC,
+    SIDED
+};
+
+// Side A: Normal Route
+// Side B: Alternate/Weird Route
+// Side C: Twisted/Experimental Route/AWP
+// Side D: Skills route
+AutonStrategy autonStrategy = SIDED; // Skills runs automatically every time
+
+void get_start_pose(StartPosition pos, double &x, double &y, double &heading_deg) {
+    switch (pos) {
+        case RED_LEFT:   x = -72.0; y =   0.0; heading_deg = -90.0; break; // faces +x
+        case RED_BOTTOM: x =   0.0; y = -72.0; heading_deg =   0.0; break; // faces +y
+        case BLUE_RIGHT: x =  72.0; y =   0.0; heading_deg =  90.0; break; // faces -x
+        case BLUE_TOP:   x =   0.0; y =  72.0; heading_deg = 180.0; break; // faces -y
+    }
+}
+
+// Average both motors on each side (a motor_group only reports its first motor).
+double left_wheel_deg()  { return (LF.position(degrees) + LB.position(degrees)) / 2.0; }
+double right_wheel_deg() { return (RF.position(degrees) + RB.position(degrees)) / 2.0; }
+
+void odom_init(double start_x, double start_y, double start_heading_rad) {
+    global_x = start_x;
+    global_y = start_y;
+    global_heading_rad = start_heading_rad;
+
+    // Snapshot encoders so earlier movement isn't counted as travel.
+    prev_right_wheel_deg = right_wheel_deg();
+    prev_left_wheel_deg = left_wheel_deg();
+}
+
+void odom_update() {
+    const double right_deg = right_wheel_deg();
+    const double left_deg = left_wheel_deg();
+
+    // Distance each side traveled since the last update (in).
+    const double delta_right =
+        (right_deg - prev_right_wheel_deg) * DRIVE_INCHES_PER_DEGREE * RIGHT_ODOM_SCALE;
+    const double delta_left =
+        (left_deg - prev_left_wheel_deg) * DRIVE_INCHES_PER_DEGREE * LEFT_ODOM_SCALE;
+
+    prev_right_wheel_deg = right_deg;
+    prev_left_wheel_deg = left_deg;
+
+    const double arc_dist = (delta_right + delta_left) / 2.0;
+    const double delta_heading =
+        ((delta_right - delta_left) / ROBOT_TRACK_WIDTH_IN) * TURN_ODOM_SCALE;
+
+    // Arc math: when turning, the straight-line distance covered is shorter
+    // than the arc length. This is more accurate than treating it as a line.
+    double chord = arc_dist;
+    if (fabs(delta_heading) > 1e-6) {
+        chord = 2.0 * sin(delta_heading / 2.0) * (arc_dist / delta_heading);
+    }
+    const double average_heading = global_heading_rad + delta_heading / 2.0;
+
+    // Heading 0 faces +Y; positive heading turns left (CCW).
+    global_x += -chord * sin(average_heading);
+    global_y +=  chord * cos(average_heading);
+    global_heading_rad += delta_heading;
+}
+
+int odom_task(void) {
+    // Normally pre_auton() has already initialized the selected start pose.
+    // Keep this fallback in case the task is started without the selector.
+    if (!odom_initialized) {
+        double start_x, start_y, start_heading_deg;
+        get_start_pose(startPos, start_x, start_y, start_heading_deg);
+        odom_init(start_x, start_y, start_heading_deg * (M_PI / 180.0));
+        odom_initialized = true;
+    }
+
+    // Continuously integrate drive-motor encoder changes into field coordinates.
+    while (true) {
+        odom_update();
+        this_thread::sleep_for(10);
+    }
+    return 0;
+}
+
+// Live odometry readout on the Brain screen (refreshes every 100ms).
+// L/R deg are raw encoder readings - if they don't change when you drive,
+// the problem is the motors/ports, not the odometry math.
+int display_task(void) {
+    Brain.Screen.clearScreen();
+    Brain.Screen.setPenColor(color::white);
+    while (true) {
+        // Snapshot each shared value once per refresh for a consistent readout.
+        double shown_x = global_x;
+        double shown_y = global_y;
+        double shown_heading_deg = global_heading_rad * (180.0 / M_PI);
+        double shown_left_deg = left_wheel_deg();
+        double shown_right_deg = right_wheel_deg();
+
+        Brain.Screen.setCursor(1, 1);
+        Brain.Screen.print("X: %8.2f in       ", shown_x);
+        Brain.Screen.setCursor(2, 1);
+        Brain.Screen.print("Y: %8.2f in       ", shown_y);
+        Brain.Screen.setCursor(3, 1);
+        Brain.Screen.print("HEADING: %8.1f deg       ", shown_heading_deg);
+        Brain.Screen.setCursor(4, 1);
+        Brain.Screen.print("L encoder: %9.1f deg       ", shown_left_deg);
+        Brain.Screen.setCursor(5, 1);
+        Brain.Screen.print("R encoder: %9.1f deg       ", shown_right_deg);
+        Brain.Screen.setCursor(6, 1);
+        Brain.Screen.print("ODOM: %s       ", odom_initialized ? "RUNNING" : "WAITING");
+        this_thread::sleep_for(50);
+    }
+    return 0;
+}
+
+// ============================================================
+// PID
+// ============================================================
+struct PID {
+    double kP, kI, kD;
+    double integral_limit = 0;   // 0 = no clamp
+    double error = 0, prev_error = 0, integral = 0;
+
+    PID(double p, double i, double d, double i_limit = 0)
+        : kP(p), kI(i), kD(d), integral_limit(i_limit) {}
+
+    double compute(double target, double current) {
+        error = target - current;
+        integral += error;
+
+        if (integral_limit != 0) {
+            if (integral > integral_limit) integral = integral_limit;
+            if (integral < -integral_limit) integral = -integral_limit;
+        }
+        if ((error > 0 && prev_error < 0) || (error < 0 && prev_error > 0)) {
+            integral = 0;
+        }
+
+        double derivative = error - prev_error;
+        prev_error = error;
+        return (kP * error) + (kI * integral) + (kD * derivative);
+    }
+
+    void reset() { error = 0; prev_error = 0; integral = 0; }
+};
+
+double normalize_deg(double deg) {
+    while (deg > 180)  deg -= 360;
+    while (deg < -180) deg += 360;
+    return deg;
+}
+
+PID turnPID(0.6, 0.0, 0.05, 20);   // tune
+PID drivePID(2.0, 0.0, 0.1, 20);   // tune
+
+// TURN_SHORTEST picks the closer direction; TURN_CW/TURN_CCW force one.
+enum TurnDirection { TURN_SHORTEST, TURN_CW, TURN_CCW };
+
+void turn_to_heading(double target_heading_deg, TurnDirection dir = TURN_SHORTEST, double timeout_ms = 3000) {
+    turnPID.reset();
+    uint32_t start = Brain.Timer.system();
+
+    while (Brain.Timer.system() - start < timeout_ms) {
+        double current_deg = global_heading_rad * (180.0 / M_PI);
+        double raw_error = target_heading_deg - current_deg;
+        double error_deg;
+
+        if (dir == TURN_CW) {
+            error_deg = raw_error;
+            while (error_deg < 0) error_deg += 360.0;
+        } else if (dir == TURN_CCW) {
+            error_deg = raw_error;
+            while (error_deg > 0) error_deg -= 360.0;
+        } else {
+            error_deg = normalize_deg(raw_error);
+        }
+
+        double output = turnPID.compute(error_deg, 0);
+        output = clampd(output, -100.0, 100.0);
+
+        LS.spin(forward, -output, pct);
+        RS.spin(forward, output, pct);
+
+        if (fabs(normalize_deg(raw_error)) < 1.0) break;
+        this_thread::sleep_for(10);
+    }
+    RS.stop();
+    LS.stop();
+}
+
+// Swing turn: one side stays still, the other drives, so the robot arcs
+// around the still side (vs. pivoting in place like turn_to_heading).
+enum SwingSide { SWING_LEFT, SWING_RIGHT }; // side that stays STILL
+
+void swing_to_heading(double target_heading_deg, SwingSide stillSide, TurnDirection dir = TURN_SHORTEST, double timeout_ms = 3000) {
+    turnPID.reset();
+    uint32_t start = Brain.Timer.system();
+
+    while (Brain.Timer.system() - start < timeout_ms) {
+        double current_deg = global_heading_rad * (180.0 / M_PI);
+        double raw_error = target_heading_deg - current_deg;
+        double error_deg;
+
+        if (dir == TURN_CW) {
+            error_deg = raw_error;
+            while (error_deg < 0) error_deg += 360.0;
+        } else if (dir == TURN_CCW) {
+            error_deg = raw_error;
+            while (error_deg > 0) error_deg -= 360.0;
+        } else {
+            error_deg = normalize_deg(raw_error);
+        }
+
+        double output = turnPID.compute(error_deg, 0);
+        output = clampd(output, -100.0, 100.0);
+
+        // Only the moving side gets power.
+        if (stillSide == SWING_LEFT) {
+            LS.stop();
+            RS.spin(forward, output, pct);
+        } else {
+            RS.stop();
+            LS.spin(forward, -output, pct);
+        }
+
+        if (fabs(normalize_deg(raw_error)) < 1.0) break;
+        this_thread::sleep_for(10);
+    }
+    RS.stop();
+    LS.stop();
+}
+
+void Swing_To_Heading(double target_deg, SwingSide stillSide, TurnDirection dir = TURN_SHORTEST, double timeout_ms = 3000) {
+    swing_to_heading(target_deg, stillSide, dir, timeout_ms);
+}
+
+void drive_to_point(double target_x, double target_y, double timeout_ms = 4000) {
+    drivePID.reset();
+    uint32_t start = Brain.Timer.system();
+
+    while (Brain.Timer.system() - start < timeout_ms) {
+        double dx = target_x - global_x;
+        double dy = target_y - global_y;
+        double dist_error = sqrt(dx * dx + dy * dy);
+
+        double target_heading_deg = atan2(dx, dy) * (180.0 / M_PI);
+        double current_deg = global_heading_rad * (180.0 / M_PI);
+        double heading_error_deg = normalize_deg(target_heading_deg - current_deg);
+
+        double drive_output = drivePID.compute(dist_error, 0);
+        drive_output = clampd(drive_output, -100.0, 100.0);
+        double turn_output = heading_error_deg * 0.3;
+        turn_output = clampd(turn_output, -30.0, 30.0);
+
+        RS.spin(forward, drive_output - turn_output, pct);
+        LS.spin(forward, drive_output + turn_output, pct);
+
+        if (dist_error < 1.0) break;
+        this_thread::sleep_for(10);
+    }
+    RS.stop();
+    LS.stop();
+}
+
+void RS_Drive(directionType dir, int degrees, int speed){
+  RS.spinFor(dir, degrees, vex::rotationUnits::deg, speed, velocityUnits::pct, true);
+}
+void LS_Drive(directionType dir, int degrees, int speed){
+  LS.spinFor(dir, degrees, vex::rotationUnits::deg, speed, velocityUnits::pct, true);
+}
+
+// ---- Wrappers matching the command names used in the auton routes ----
+void Drive_To_Point(double x, double y, double timeout_ms = 4000) { drive_to_point(x, y, timeout_ms); }
+void Turn_To_Heading(double target_deg, TurnDirection dir = TURN_SHORTEST, double timeout_ms = 3000) { turn_to_heading(target_deg, dir, timeout_ms); }
+void IntakeSpin(int speed_pct, double duration_ms) {
+    Intake.spin(forward, speed_pct, pct);
+    this_thread::sleep_for(duration_ms);
+    Intake.stop();
+}
+
+// ============================================================
+// CASCADE LIFT + PID
+// ============================================================
+// Unlike the drive PID, the lift PID runs forever in the background so it
+// keeps holding position against gravity after it arrives.
+
+motor LiftL(PORT2, gearSetting::ratio18_1, true); // update port/gear ratio
+motor LiftR(PORT19, gearSetting::ratio18_1, true);
+motor_group Lift(LiftL, LiftR);
+
+// Stage heights in lift motor degrees (placeholders - measure yours).
+const double LIFT_DOWN_DEG = 0.0;
+const double LIFT_MID_DEG  = 400.0;
+const double LIFT_UP_DEG   = 850.0;
+
+double liftTargetDeg = LIFT_DOWN_DEG;
+
+// Tracks which stage the lift is at so one button can cycle through them.
+enum LiftState { LIFT_STATE_DOWN, LIFT_STATE_MID, LIFT_STATE_UP };
+LiftState liftState = LIFT_STATE_DOWN;
+
+// kI is nonzero here: the integral cancels the constant sag from gravity.
+PID liftPID(0.8, 0.05, 0.1, 15);
+
+void lift_set_target(double target_deg) {
+    liftTargetDeg = target_deg;
+}
+
+void Lift_Move_To(double target_deg, double timeout_ms = 3000) {
+    lift_set_target(target_deg);
+    uint32_t start = Brain.Timer.system();
+    while (Brain.Timer.system() - start < timeout_ms) {
+        if (fabs(Lift.position(degrees) - target_deg) < 10.0) break;
+        this_thread::sleep_for(10);
+    }
+}
+
+int lift_task(void) {
+    Lift.setStopping(hold); // backup brake
+    while (true) {
+        double current_deg = Lift.position(degrees);
+        double output = liftPID.compute(liftTargetDeg, current_deg);
+        output = clampd(output, -100.0, 100.0);
+
+        Lift.spin(forward, output, pct); // no stop() on purpose
+
+        this_thread::sleep_for(10);
+    }
+    return 0;
+}
+
+// ---- Toggle locations (field-fixed, same for every start) ----
+const double FIELD_HALF_IN = 72.0;
+const double TOGGLE_STANDOFF_IN = 6.0; // starting guess - measure your mechanism
+
+const double TOGGLE_TOP_X    = 0.0, TOGGLE_TOP_Y    =  (FIELD_HALF_IN - TOGGLE_STANDOFF_IN);
+const double TOGGLE_BOTTOM_X = 0.0, TOGGLE_BOTTOM_Y = -(FIELD_HALF_IN - TOGGLE_STANDOFF_IN);
+const double TOGGLE_LEFT_X   = -(FIELD_HALF_IN - TOGGLE_STANDOFF_IN), TOGGLE_LEFT_Y  = 0.0;
+const double TOGGLE_RIGHT_X  =  (FIELD_HALF_IN - TOGGLE_STANDOFF_IN), TOGGLE_RIGHT_Y = 0.0;
+
+void touch_toggle_top()    { drive_to_point(TOGGLE_TOP_X, TOGGLE_TOP_Y);       turn_to_heading(0.0);   }
+void touch_toggle_bottom() { drive_to_point(TOGGLE_BOTTOM_X, TOGGLE_BOTTOM_Y); turn_to_heading(180.0); }
+void touch_toggle_left()   { drive_to_point(TOGGLE_LEFT_X, TOGGLE_LEFT_Y);     turn_to_heading(90.0);  }
+void touch_toggle_right()  { drive_to_point(TOGGLE_RIGHT_X, TOGGLE_RIGHT_Y);   turn_to_heading(-90.0); }
+
+// ============================================================
+// RAMSETE TRAJECTORY CONTROLLER
+// ============================================================
+const double MAX_VELOCITY_IN_PER_SEC  = 40.0; // top speed at 100% power - MEASURE
+const double RAMSETE_CRUISE_VEL_IN_PER_SEC = 20.0; // path cruise speed
+
+const double RAMSETE_B    = 2.0; // higher = pulls back onto path faster, rougher
+const double RAMSETE_ZETA = 0.7; // higher = smoother/slower, lower = oscillates
+
+double sinc(double x) { // sin(x)/x, 1 at x=0
+    if (fabs(x) < 1e-6) return 1.0;
+    return sin(x) / x;
+}
+
+// Simple reference version: constant speed, then snaps to 0 (no decel).
+// Ramsete_Follow_Path() below has a real trapezoidal profile.
+void ramsete_drive_to_point(double target_x, double target_y, double timeout_ms = 4000) {
+    double start_x = global_x, start_y = global_y;
+    double path_dx = target_x - start_x, path_dy = target_y - start_y;
+    double total_dist = sqrt(path_dx * path_dx + path_dy * path_dy);
+    double path_heading_rad = atan2(path_dx, path_dy);
+    double total_time_sec = total_dist / RAMSETE_CRUISE_VEL_IN_PER_SEC;
+
+    uint32_t start_ms = Brain.Timer.system();
+    while (Brain.Timer.system() - start_ms < timeout_ms) {
+        double t = (Brain.Timer.system() - start_ms) / 1000.0;
+        double frac = clampd(t / total_time_sec, 0.0, 1.0);
+
+        double x_d = start_x + path_dx * frac;
+        double y_d = start_y + path_dy * frac;
+        double v_d = (frac < 1.0) ? RAMSETE_CRUISE_VEL_IN_PER_SEC : 0.0;
+        double omega_d = 0.0;
+
+        double theta = global_heading_rad;
+        double global_dx = x_d - global_x;
+        double global_dy = y_d - global_y;
+
+        double e_right   = cos(theta) * global_dx + sin(theta) * global_dy;
+        double e_forward = -sin(theta) * global_dx + cos(theta) * global_dy;
+        double e_theta   = normalize_deg((path_heading_rad - theta) * (180.0 / M_PI)) * (M_PI / 180.0);
+
+        double k = 2.0 * RAMSETE_ZETA * sqrt(omega_d * omega_d + RAMSETE_B * v_d * v_d);
+        double v     = v_d * cos(e_theta) + k * e_forward;
+        double omega = omega_d + k * e_theta + RAMSETE_B * v_d * sinc(e_theta) * e_right;
+
+        double v_right = v + omega * (ROBOT_TRACK_WIDTH_IN / 2.0);
+        double v_left  = v - omega * (ROBOT_TRACK_WIDTH_IN / 2.0);
+
+        double right_pct = clampd((v_right / MAX_VELOCITY_IN_PER_SEC) * 100.0, -100.0, 100.0);
+        double left_pct  = clampd((v_left  / MAX_VELOCITY_IN_PER_SEC) * 100.0, -100.0, 100.0);
+
+        RS.spin(forward, right_pct, pct);
+        LS.spin(forward, left_pct, pct);
+
+        double remaining_dist = sqrt(e_forward * e_forward + e_right * e_right);
+        if (frac >= 1.0 && remaining_dist < 1.0) break;
+        this_thread::sleep_for(10);
+    }
+    RS.stop();
+    LS.stop();
+}
+
+struct RamsetePoint { double x; double y; };
+void Ramsete_Follow_Path(RamsetePoint* waypoints, int numWaypoints, double timeout_ms); // forward declaration
+
+// A single point is a 1-waypoint path, so this uses the profiled follower.
+void Ramsete_Drive_To_Point(double x, double y, double timeout_ms = 8000) {
+    RamsetePoint single[] = { {x, y} };
+    Ramsete_Follow_Path(single, 1, timeout_ms);
+}
+const int RAMSETE_MAX_WAYPOINTS = 10;
+
+const double RAMSETE_ACCEL_IN_PER_SEC2 = 30.0;
+
+void Ramsete_Follow_Path(RamsetePoint* waypoints, int numWaypoints, double timeout_ms = 8000) {
+    if (numWaypoints < 1 || numWaypoints > RAMSETE_MAX_WAYPOINTS) return;
+
+    RamsetePoint pts[RAMSETE_MAX_WAYPOINTS + 1];
+    pts[0] = { global_x, global_y };
+    for (int i = 0; i < numWaypoints; i++) pts[i + 1] = waypoints[i];
+    int numPts = numWaypoints + 1;
+
+    double cumDist[RAMSETE_MAX_WAYPOINTS + 1];
+    cumDist[0] = 0.0;
+    for (int i = 1; i < numPts; i++) {
+        double dx = pts[i].x - pts[i - 1].x;
+        double dy = pts[i].y - pts[i - 1].y;
+        cumDist[i] = cumDist[i - 1] + sqrt(dx * dx + dy * dy);
+    }
+    double total_dist = cumDist[numPts - 1];
+    if (total_dist < 0.01) return;
+
+    double a = RAMSETE_ACCEL_IN_PER_SEC2;
+    double cruiseV = RAMSETE_CRUISE_VEL_IN_PER_SEC;
+    double accel_dist = (cruiseV * cruiseV) / (2.0 * a);
+    double peakV = cruiseV;
+    double accel_time, cruise_time, decel_time;
+
+    if (2.0 * accel_dist > total_dist) {
+        peakV = sqrt(a * total_dist);
+        accel_time = peakV / a;
+        cruise_time = 0.0;
+        decel_time = accel_time;
+        accel_dist = total_dist / 2.0;
+    } else {
+        accel_time = cruiseV / a;
+        double cruise_dist = total_dist - 2.0 * accel_dist;
+        cruise_time = cruise_dist / cruiseV;
+        decel_time = accel_time;
+    }
+    double total_time_sec = accel_time + cruise_time + decel_time;
+
+    uint32_t start_ms = Brain.Timer.system();
+    while (Brain.Timer.system() - start_ms < timeout_ms) {
+        double t = (Brain.Timer.system() - start_ms) / 1000.0;
+        double tc = clampd(t, 0.0, total_time_sec);
+
+        double s, v_d;
+        if (tc < accel_time) {
+            s = 0.5 * a * tc * tc;
+            v_d = a * tc;
+        } else if (tc < accel_time + cruise_time) {
+            double tt = tc - accel_time;
+            s = accel_dist + peakV * tt;
+            v_d = peakV;
+        } else {
+            double td = tc - accel_time - cruise_time;
+            s = (total_dist - accel_dist) + peakV * td - 0.5 * a * td * td;
+            v_d = peakV - a * td;
+        }
+        s = clampd(s, 0.0, total_dist);
+        if (t >= total_time_sec) v_d = 0.0;
+
+        int seg = 0;
+        while (seg < numPts - 2 && s > cumDist[seg + 1]) seg++;
+        double seg_len = cumDist[seg + 1] - cumDist[seg];
+        double seg_frac = (seg_len > 0.001) ? (s - cumDist[seg]) / seg_len : 1.0;
+
+        double seg_dx = pts[seg + 1].x - pts[seg].x;
+        double seg_dy = pts[seg + 1].y - pts[seg].y;
+        double x_d = pts[seg].x + seg_dx * seg_frac;
+        double y_d = pts[seg].y + seg_dy * seg_frac;
+        double path_heading_rad = atan2(seg_dx, seg_dy);
+        double omega_d = 0.0;
+
+        double theta = global_heading_rad;
+        double global_dx = x_d - global_x;
+        double global_dy = y_d - global_y;
+
+        double e_right   = cos(theta) * global_dx + sin(theta) * global_dy;
+        double e_forward = -sin(theta) * global_dx + cos(theta) * global_dy;
+        double e_theta   = normalize_deg((path_heading_rad - theta) * (180.0 / M_PI)) * (M_PI / 180.0);
+
+        double k = 2.0 * RAMSETE_ZETA * sqrt(omega_d * omega_d + RAMSETE_B * v_d * v_d);
+        double v     = v_d * cos(e_theta) + k * e_forward;
+        double omega = omega_d + k * e_theta + RAMSETE_B * v_d * sinc(e_theta) * e_right;
+
+        double v_right = v + omega * (ROBOT_TRACK_WIDTH_IN / 2.0);
+        double v_left  = v - omega * (ROBOT_TRACK_WIDTH_IN / 2.0);
+
+        double right_pct = clampd((v_right / MAX_VELOCITY_IN_PER_SEC) * 100.0, -100.0, 100.0);
+        double left_pct  = clampd((v_left  / MAX_VELOCITY_IN_PER_SEC) * 100.0, -100.0, 100.0);
+
+        RS.spin(forward, right_pct, pct);
+        LS.spin(forward, left_pct, pct);
+
+        double dist_to_final = sqrt((pts[numPts - 1].x - global_x) * (pts[numPts - 1].x - global_x) +
+                                     (pts[numPts - 1].y - global_y) * (pts[numPts - 1].y - global_y));
+        if (t >= total_time_sec && dist_to_final < 1.5) break;
+        this_thread::sleep_for(10);
+    }
+    RS.stop();
+    LS.stop();
+}
+
+// ============================================================
+// ASYNCHRONOUS PATH FOLLOWING
+// ============================================================
+// The drive functions above block. This runs a path on a background task
+// so the main auton can do other things (like run the intake) meanwhile.
+
+RamsetePoint asyncPathBuffer[RAMSETE_MAX_WAYPOINTS];
+int asyncPathCount = 0;
+bool asyncPathRunning = false;
+
+int asyncPathTaskFn(void) {
+    Ramsete_Follow_Path(asyncPathBuffer, asyncPathCount);
+    asyncPathRunning = false;
+    return 0;
+}
+
+// Starts the path and returns immediately.
+void Ramsete_Follow_Path_Async(RamsetePoint* waypoints, int numWaypoints) {
+    if (numWaypoints < 1 || numWaypoints > RAMSETE_MAX_WAYPOINTS) return;
+    if (asyncPathRunning) return; // one async path at a time
+
+    for (int i = 0; i < numWaypoints; i++) asyncPathBuffer[i] = waypoints[i];
+    asyncPathCount = numWaypoints;
+    asyncPathRunning = true;
+
+    vex::task asyncPathTask(asyncPathTaskFn);
+}
+
+bool Ramsete_Path_Is_Done(void) { return !asyncPathRunning; }
+
+// Blocks until the async path finishes.
+void Ramsete_Wait_For_Path(void) {
+    while (asyncPathRunning) this_thread::sleep_for(10);
+}
+
+// ============================================================
+// PRIMARY AUTONOMOUS ROUTES
+// ============================================================
+/*==============================================================
+COMMANDS:
+Drive_To_Point(X, Y);
+IntakeSpin(speed_pct, duration_ms);
+Turn_To_Heading(Deg, CW/CCW) - pivots in place
+Swing_To_Heading(Deg, SWING_LEFT/SWING_RIGHT, CW/CCW) - arcs around the still side
+Lift: lift_set_target(LIFT_DOWN_DEG / LIFT_MID_DEG / LIFT_UP_DEG) - non-blocking
+      Lift_Move_To(...) - blocking
+*/
+
+void auton_red_left (void){
+    RS_Drive(directionType:: rev, 300, 40);
+    LS_Drive(directionType:: rev, 300, 40);
+    lift_set_target(190);
+    RamsetePoint SideA_Red_Left_1[] = { {-48, -24} };
+    Ramsete_Follow_Path(SideA_Red_Left_1, 1);
+    //lift drop
+    lift_set_target(0);
+    Swing_To_Heading(45, SWING_LEFT);
+    RamsetePoint SideA_Red_Left_2[] = { {-24, -24} };
+    Ramsete_Follow_Path(SideA_Red_Left_2, 1);
+    IntakeSpin(100, 2000);
+    lift_set_target(190);
+    RamsetePoint SideA_Red_Left_3[] = { {-48, -24} };
+    Ramsete_Follow_Path(SideA_Red_Left_3, 1);
+    //Lift drop
+    lift_set_target(0);
+    Swing_To_Heading(45, SWING_LEFT, TURN_CW);
+    RamsetePoint SideA_Red_Left_4[] = { {-24, -48} };
+    Ramsete_Follow_Path(SideA_Red_Left_4, 1);
+    IntakeSpin(100, 2000);
+    RamsetePoint SideA_Red_Left_5[] = { {-48, -24} };
+    Ramsete_Follow_Path(SideA_Red_Left_5, 1);
+    lift_set_target(190);
+    //lift drop
+    RamsetePoint SideA_Red_Left_6[] = { {-24, -65} };
+    Ramsete_Follow_Path(SideA_Red_Left_6, 1);
+
+}
+
+
+void auton_red_bottom(void) {
+    RS_Drive(directionType:: rev, 300, 40);
+    LS_Drive(directionType:: rev, 300, 40);
+    lift_set_target(190);
+    RamsetePoint SideA_Red_Bottom_1[] = { {-24, -48} };
+    Ramsete_Follow_Path(SideA_Red_Bottom_1, 1);
+    //lift drop
+    lift_set_target(0);
+    Swing_To_Heading(45, SWING_LEFT);
+    RamsetePoint SideA_Red_Bottom_2[] = { {-24, -24} };
+    Ramsete_Follow_Path(SideA_Red_Bottom_2, 1);
+    IntakeSpin(100, 2000);
+    lift_set_target(190);
+    RamsetePoint SideA_Red_Bottom_3[] = { {-24, -48} };
+    Ramsete_Follow_Path(SideA_Red_Bottom_3, 1);
+    //lift drop
+    lift_set_target(0);
+    RamsetePoint SideA_Red_Bottom_4[] = { {-48, -48} };
+    Ramsete_Follow_Path(SideA_Red_Bottom_4, 1);
+    IntakeSpin(100, 2000);
+    RamsetePoint SideA_Red_Bottom_5[] = { {-24, -48} };
+    Ramsete_Follow_Path(SideA_Red_Bottom_5, 1);
+    lift_set_target(190);
+    //lift drop
+    RamsetePoint SideA_Red_Bottom_6[] = { {-24, -65} };
+    Ramsete_Follow_Path(SideA_Red_Bottom_6, 1);
+}
+
+void auton_blue_right(void){
+    RS_Drive(directionType:: rev, 300, 40);
+    LS_Drive(directionType:: rev, 300, 40);
+    lift_set_target(190);
+    RamsetePoint SideA_Blue_Right_1[] = { {48, 24} };
+    Ramsete_Follow_Path(SideA_Blue_Right_1, 1);
+    //lift drop
+    lift_set_target(0);
+    Swing_To_Heading(45, SWING_LEFT);
+    RamsetePoint SideA_Blue_Right_2[] = { {24, 24} };
+    Ramsete_Follow_Path(SideA_Blue_Right_2, 1);
+    IntakeSpin(100, 2000);
+    lift_set_target(190);
+    RamsetePoint SideA_Blue_Right_3[] = { {48, 24} };
+    Ramsete_Follow_Path(SideA_Blue_Right_3, 1);
+    //Lift drop
+    lift_set_target(0);
+    Swing_To_Heading(45, SWING_LEFT, TURN_CW);
+    RamsetePoint SideA_Blue_Right_4[] = { {24, 48} };
+    Ramsete_Follow_Path(SideA_Blue_Right_4, 1);
+    IntakeSpin(100, 2000);
+    RamsetePoint SideA_Blue_Right_5[] = { {48, 24} };
+    Ramsete_Follow_Path(SideA_Blue_Right_5, 1);
+    lift_set_target(190);
+    //lift drop
+    RamsetePoint SideA_Blue_Right_6[] = { {65, 48} };
+    Ramsete_Follow_Path(SideA_Blue_Right_6, 1);
+}
+
+void auton_blue_top(void) {
+    RS_Drive(directionType:: rev, 300, 40);
+    LS_Drive(directionType:: rev, 300, 40);
+    lift_set_target(190);
+    RamsetePoint SideA_Blue_Top_1[] = { {24, 48} };
+    Ramsete_Follow_Path(SideA_Blue_Top_1, 1);
+    //lift drop
+    lift_set_target(0);
+    Swing_To_Heading(45, SWING_LEFT);
+    RamsetePoint SideA_Blue_Top_2[] = { {24, 24} };
+    Ramsete_Follow_Path(SideA_Blue_Top_2, 1);
+    IntakeSpin(100, 2000);
+    lift_set_target(190);
+    RamsetePoint SideA_Blue_Top_3[] = { {24, 48} };
+    Ramsete_Follow_Path(SideA_Blue_Top_3, 1);
+    //lift drop
+    lift_set_target(0);
+    RamsetePoint SideA_Blue_Top_4[] = { {24, 24} };
+    Ramsete_Follow_Path(SideA_Blue_Top_4, 1);
+    IntakeSpin(100, 2000);
+    RamsetePoint SideA_Blue_Top_5[] = { {48, 24} };
+    Ramsete_Follow_Path(SideA_Blue_Top_5, 1);
+    lift_set_target(190);
+    //lift drop
+    RamsetePoint SideA_Blue_Top_6[] = { {65, 48} };
+    Ramsete_Follow_Path(SideA_Blue_Top_6, 1);
+}   
+
+// ============================================================
+// SIDE B AUTONOMOUS ROUTES
+// ============================================================
+void auton_red_left_alt(void) {
+
+}
+
+void auton_red_bottom_alt(void) {
+    RS_Drive(directionType:: rev, 300, 40);
+    LS_Drive(directionType:: rev, 300, 40);
+    lift_set_target(190);
+    RamsetePoint SideB_Red_Bottom_1[] = { {-12, -24}, {-24, -48} };
+    Ramsete_Follow_Path(SideB_Red_Bottom_1, 2);
+    //lift drop
+    lift_set_target(0);
+    Swing_To_Heading(45, SWING_LEFT, TURN_CW);
+    Ramsete_Drive_To_Point(0, -24);
+    IntakeSpin(100, 2000);
+    lift_set_target(190);
+    Swing_To_Heading(90, SWING_LEFT, TURN_CW);
+    RamsetePoint SideB_Red_Bottom_3[] = { {24, -48} };
+    Ramsete_Follow_Path(SideB_Red_Bottom_3, 1);
+    //lift drop
+    lift_set_target(0);
+    Swing_To_Heading(45, SWING_LEFT, TURN_CCW);
+    Ramsete_Drive_To_Point(24, -24);
+    IntakeSpin(100, 2000);
+    RamsetePoint SideB_Red_Bottom_5[] = { {24, -48} };
+    Ramsete_Follow_Path(SideB_Red_Bottom_5, 1);
+    lift_set_target(190);
+    //lift drop
+    RamsetePoint SideB_Red_Bottom_6[] = { {-65, -48} };
+    Ramsete_Follow_Path(SideB_Red_Bottom_6, 1);
+}
+
+void auton_blue_right_alt(void) {
+    RS_Drive(directionType:: rev, 300, 40);
+    LS_Drive(directionType:: rev, 300, 40);
+    lift_set_target(190);
+    RamsetePoint SideB_Blue_Right_1[] = { {12, 24}, {24, 48} };
+    Ramsete_Follow_Path(SideB_Blue_Right_1, 2);
+    //lift drop
+    lift_set_target(0);
+    Swing_To_Heading(45, SWING_LEFT, TURN_CW);
+    Ramsete_Drive_To_Point(0, 24);
+    IntakeSpin(100, 2000);
+    lift_set_target(190);
+    Swing_To_Heading(90, SWING_LEFT, TURN_CW);
+    RamsetePoint SideB_Blue_Right_3[] = { {-24, 48} };
+    Ramsete_Follow_Path(SideB_Blue_Right_3, 1);
+    //lift drop
+    lift_set_target(0);
+    Swing_To_Heading(45, SWING_LEFT, TURN_CCW);
+    Ramsete_Drive_To_Point(-24, 24);
+    IntakeSpin(100, 2000);
+    RamsetePoint SideB_Blue_Right_5[] = { {-24, 48} };
+    Ramsete_Follow_Path(SideB_Blue_Right_5, 1);
+    lift_set_target(190);
+    //lift drop
+    RamsetePoint SideB_Blue_Right_6[] = { {65, 48} };
+    Ramsete_Follow_Path(SideB_Blue_Right_6, 1);
+}
+
+void auton_blue_top_alt(void) {
+
+}
+
+// ============================================================
+// SIDE C AUTONOMOUS ROUTES
+// ============================================================
+void auton_red_left_sideC(void) {
+
+}
+
+void auton_red_bottom_sideC(void) {
+
+}
+
+void auton_blue_right_sideC(void) {
+
+}
+
+void auton_blue_top_sideC(void) {
+
+}
+
+// SIDE D: Skills routine. Add the skills run here when ready.
+void auton_skills(void) {
+
+}
+
+void autonomous(void) {
+    if (autonStrategy == SIDED) {
+        auton_skills();
+        return;
+    }
+    switch (startPos) {
+        case RED_LEFT:
+            if (autonStrategy == SIDEA)      auton_red_left();
+            else if (autonStrategy == SIDEB) auton_red_left_alt();
+            else                             auton_red_left_sideC();
+            break;
+        case RED_BOTTOM:
+            if (autonStrategy == SIDEA)      auton_red_bottom();
+            else if (autonStrategy == SIDEB) auton_red_bottom_alt();
+            else                             auton_red_bottom_sideC();
+            break;
+        case BLUE_RIGHT:
+            if (autonStrategy == SIDEA)      auton_blue_right();
+            else if (autonStrategy == SIDEB) auton_blue_right_alt();
+            else                             auton_blue_right_sideC();
+            break;
+        case BLUE_TOP:
+            if (autonStrategy == SIDEA)      auton_blue_top();
+            else if (autonStrategy == SIDEB) auton_blue_top_alt();
+            else                             auton_blue_top_sideC();
+            break;
+    }
+}
+
+// ============================================================
+// COMPETITION CALLBACKS
+// ============================================================
+const char* startPosLabel(StartPosition pos) {
+    switch (pos) {
+        case RED_LEFT:   return "RED LEFT";
+        case RED_BOTTOM: return "RED BOTTOM";
+        case BLUE_RIGHT: return "BLUE RIGHT";
+        case BLUE_TOP:   return "BLUE TOP";
+        default:         return "UNKNOWN";
+    }
+}
+
+const char* autonStrategyLabel(AutonStrategy strat) {
+    switch (strat) {
+        case SIDEA: return "SIDE A";
+        case SIDEB: return "SIDE B";
+        case SIDEC: return "SIDE C";
+        case SIDED: return "SIDE D - SKILLS";
+        default:    return "UNKNOWN";
+    }
+}
+
+// ============================================================
+// AUTON SELECTOR (Brain touchscreen)
+// ============================================================
+// Pick everything on the Brain screen instead of re-flashing.
+// Flow: SIDE? -> COLOR? -> POSITION?
+
+struct SelectorButton {
+    int x, y, w, h;
+    const char* label;
+    color buttonColor;
+};
+
+void drawSelectorButton(const SelectorButton& b) {
+    Brain.Screen.setFillColor(color(28, 28, 28));
+    Brain.Screen.setPenColor(b.buttonColor);
+    Brain.Screen.drawRectangle(b.x, b.y, b.w, b.h);
+    Brain.Screen.printAt(b.x + 10, b.y + b.h / 2 + 5, b.label);
+}
+
+// Blocks until a NEW touch lands inside a button, then returns its index.
+int waitForButtonPress(SelectorButton* buttons, int count) {
+    // Wait for release first so one long touch can't skip pages.
+    while (Brain.Screen.pressing()) this_thread::sleep_for(20);
+    this_thread::sleep_for(100);
+
+    while (true) {
+        if (Brain.Screen.pressing()) {
+            int tx = Brain.Screen.xPosition();
+            int ty = Brain.Screen.yPosition();
+            for (int i = 0; i < count; i++) {
+                SelectorButton& b = buttons[i];
+                if (tx >= b.x && tx <= b.x + b.w && ty >= b.y && ty <= b.y + b.h) {
+                    while (Brain.Screen.pressing()) this_thread::sleep_for(20);
+                    this_thread::sleep_for(100);
+                    return i;
+                }
+            }
+            // Touch missed all buttons; wait for release.
+            while (Brain.Screen.pressing()) this_thread::sleep_for(20);
+        }
+        this_thread::sleep_for(20);
+    }
+}
+
+void run_auton_selector(void) {
+    // Ignore stray touches at power-on: wait for ~200ms of "not pressed".
+    int stableNotPressedCount = 0;
+    while (stableNotPressedCount < 10) {
+        if (!Brain.Screen.pressing()) stableNotPressedCount++;
+        else stableNotPressedCount = 0;
+        this_thread::sleep_for(20);
+    }
+
+    // ---- Step 1: SIDE? ----
+    Brain.Screen.clearScreen();
+    Brain.Screen.printAt(140, 20, "SIDE?");
+    SelectorButton sideButtons[] = {
+        {20,  40, 120, 70, "SIDE A", color::blue},
+        {160, 40, 120, 70, "SIDE B", color::purple},
+        {300, 40, 120, 70, "SIDE C", color::green},
+        {160, 125, 120, 70, "SIDE D", color::yellow}
+    };
+    for (int i = 0; i < 4; i++) drawSelectorButton(sideButtons[i]);
+    int sideChoice = waitForButtonPress(sideButtons, 4);
+    autonStrategy = (sideChoice == 0) ? SIDEA : (sideChoice == 1) ? SIDEB : (sideChoice == 2) ? SIDEC : SIDED;
+
+    // ---- Step 2: COLOR? ----
+    Brain.Screen.clearScreen();
+    Brain.Screen.printAt(140, 20, "COLOR?");
+    SelectorButton colorButtons[] = {
+        {40,  40, 150, 80, "RED", color::red},
+        {230, 40, 150, 80, "BLUE", color::blue}
+    };
+    for (int i = 0; i < 2; i++) drawSelectorButton(colorButtons[i]);
+    int colorChoice = waitForButtonPress(colorButtons, 2);
+    bool isRed = (colorChoice == 0);
+
+    // ---- Step 3: POSITION? ----
+    Brain.Screen.clearScreen();
+    Brain.Screen.printAt(110, 20, "POSITION?");
+    if (isRed) {
+        SelectorButton posButtons[] = {
+            {40,  40, 150, 80, "LEFT", color::white},
+            {230, 40, 150, 80, "BOTTOM", color::white}
+        };
+        for (int i = 0; i < 2; i++) drawSelectorButton(posButtons[i]);
+        int posChoice = waitForButtonPress(posButtons, 2);
+        startPos = (posChoice == 0) ? RED_LEFT : RED_BOTTOM;
+    } else {
+        SelectorButton posButtons[] = {
+            {40,  40, 150, 80, "RIGHT", color::white},
+            {230, 40, 150, 80, "TOP", color::white}
+        };
+        for (int i = 0; i < 2; i++) drawSelectorButton(posButtons[i]);
+        int posChoice = waitForButtonPress(posButtons, 2);
+        startPos = (posChoice == 0) ? BLUE_RIGHT : BLUE_TOP;
+    }
+
+    // ---- Brief confirmation ----
+    Brain.Screen.clearScreen();
+    Brain.Screen.printAt(30, 40, "SELECTED:");
+    Brain.Screen.printAt(30, 70, false, "%s", startPosLabel(startPos));
+    Brain.Screen.printAt(30, 100, false, "%s", autonStrategyLabel(autonStrategy));
+    this_thread::sleep_for(1000);
+}
+
+// Prints text one character at a time (typewriter effect).
+void typeOutLine(int row, const char* text, int char_delay_ms = 40) {
+    char buffer[64];
+    int len = 0;
+    while (text[len] != '\0' && len < 63) len++;
+
+    for (int i = 0; i < len; i++) {
+        buffer[i] = text[i];
+        buffer[i + 1] = '\0';
+        Brain.Screen.setCursor(row, 1);
+        Brain.Screen.print("%s", buffer);
+        this_thread::sleep_for(char_delay_ms);
+    }
+}
+
+void pre_auton(void) {
+    // Skills configuration: always start at RED LEFT; no selector is shown.
+    startPos = RED_LEFT;
+    autonStrategy = SIDED;
+
+    Brain.Screen.clearScreen();
+
+    char sideLine[32];
+    sprintf(sideLine, "AUTO: SKILLS");
+    typeOutLine(4, sideLine);
+
+    char posLine[32];
+    sprintf(posLine, "START: RED LEFT");
+    typeOutLine(5, posLine);
+
+    // Set odometry to the selected start pose (does not start driving).
+    double start_x, start_y, start_heading_deg;
+    get_start_pose(startPos, start_x, start_y, start_heading_deg);
+    odom_init(start_x, start_y, start_heading_deg * (M_PI / 180.0));
+    odom_initialized = true;
+
+    this_thread::sleep_for(1000);
+    Brain.Screen.clearScreen();
+    Brain.Screen.printAt(20, 25, "START COORDINATES");
+
+    char xLine[64];
+    sprintf(xLine, "X: %.2f in", start_x);
+    typeOutLine(3, xLine, 35);
+
+    char yLine[64];
+    sprintf(yLine, "Y: %.2f in", start_y);
+    typeOutLine(4, yLine, 35);
+
+    char headingLine[64];
+    sprintf(headingLine, "HEADING: %.1f deg", start_heading_deg);
+    typeOutLine(5, headingLine, 35);
+}
+
+
+void usercontrol(void) {
+    while (true) {
+        // DRIVE: Axis3 = forward/back; Axis1 = turn.
+        double forwardInput = apply_dead_zone(Con.Axis3.position(percentUnits::pct));
+        double turnInput = apply_dead_zone(Con.Axis1.position(percentUnits::pct));
+
+        double leftCommand = clampd(forwardInput + turnInput, -100.0, 100.0);
+        double rightCommand = clampd(forwardInput - turnInput, -100.0, 100.0);
+        LS.spin(directionType::fwd, leftCommand, velocityUnits::pct);
+        RS.spin(directionType::fwd, rightCommand, velocityUnits::pct);
+
+        // INTAKE: hold R2 = forward, hold L2 = reverse, else stop.
+        bool r2IntakePressed = Con.ButtonR2.pressing();
+        bool l2Pressed = Con.ButtonL2.pressing();
+        if (r2IntakePressed && !l2Pressed) {
+            Intake.spin(directionType::fwd, 100, velocityUnits::pct);
+        } else if (l2Pressed && !r2IntakePressed) {
+            Intake.spin(directionType::rev, 100, velocityUnits::pct);
+        } else {
+            Intake.stop(brakeType::coast);
+        }
+
+        // LIFT
+        if (Con.ButtonR2.pressing()) {
+            LiftL.spin(directionType::fwd, 100, velocityUnits::pct);
+            LiftR.spin(directionType::rev, 100, velocityUnits::pct);
+        }
+        else if (Con.ButtonL2.pressing()) {
+            LiftL.spin(directionType::rev, 100, velocityUnits::pct);
+            LiftR.spin(directionType::fwd, 100, velocityUnits::pct);
+        }
+        else {
+            Lift.stop(brakeType::hold);
+        }
+    }
+}
+int main() {
+    Competition.autonomous(autonomous);
+    Competition.drivercontrol(usercontrol);
+
+    pre_auton();
+    vex::task odomTaskHandle(odom_task);
+    vex::task liftTaskHandle(lift_task);
+    vex::task displayTaskHandle(display_task);
+
+    while (true) {
+        this_thread::sleep_for(100);
+    }
+}
